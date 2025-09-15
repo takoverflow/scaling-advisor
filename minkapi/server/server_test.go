@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gardener/scaling-advisor/minkapi/api"
+	mkapi "github.com/gardener/scaling-advisor/api/minkapi"
 	"github.com/gardener/scaling-advisor/minkapi/server/typeinfo"
 	"github.com/gardener/scaling-advisor/minkapi/server/view"
 
@@ -29,9 +29,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 type RequestParams struct {
@@ -126,11 +124,7 @@ func TestHTTPHandlers(t *testing.T) {
 	t.Cleanup(func() { s.Stop(t.Context()) })
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			t.Cleanup(func() {
-				cleanupTestPod(t, s, api.MatchCriteria{
-					LabelSelector: labels.SelectorFromSet(map[string]string{"app.kubernetes.io/component": "minkapitest"}),
-				})
-			})
+			t.Cleanup(func() { s.baseView.Reset() })
 
 			if _, err := createObjectFromFileName[corev1.Pod](t, s, "./testdata/pod-a.json", typeinfo.PodsDescriptor.GVK); err != nil {
 				t.Errorf("Error creating test object: %v", err)
@@ -243,31 +237,36 @@ func TestAPIHandlerMethods(t *testing.T) {
 			}
 
 			if resp.StatusCode != tc.expectedStatus {
-				t.Errorf("Unexpected status code, got: %d, expected: %d", resp.StatusCode, tc.expectedStatus)
+				t.Errorf("Unexpected status code, got: %s, expected: %d", resp.Status, tc.expectedStatus)
 				t.Logf(">>> Got response: %s\n", string(responseData))
 				return
 			} else if resp.StatusCode != http.StatusOK {
-				t.Logf("Expected status error: %s", resp.Status)
+				t.Logf("Expected status: %s", resp.Status)
 				return
 			}
 
-			var got any
-			switch tc.reqParams.Target {
-			case "/apis":
-				got, _ = convertJSONtoObject[metav1.APIGroupList](t, responseData)
-			case "/api":
-				got, _ = convertJSONtoObject[metav1.APIVersions](t, responseData)
-			case "/api/v1/":
-				got, _ = convertJSONtoObject[metav1.APIResourceList](t, responseData)
-			}
-			if diff := cmp.Diff(tc.want, got, nil); diff != "" {
-				t.Errorf("%s object mismatch (-want +got):\n%s", tc.reqParams.Method, diff)
-				return
-			} else {
-				t.Logf("Got expected output")
-			}
+			validateAPIResponse(t, tc.reqParams.Target, tc.want, responseData)
 		})
 	}
+}
+
+func validateAPIResponse(t *testing.T, target string, want any, responseData []byte) {
+	var got any
+	switch target {
+	case "/apis":
+		got, _ = convertJSONtoObject[metav1.APIGroupList](t, responseData)
+	case "/api":
+		got, _ = convertJSONtoObject[metav1.APIVersions](t, responseData)
+	case "/api/v1/":
+		got, _ = convertJSONtoObject[metav1.APIResourceList](t, responseData)
+	}
+	if diff := cmp.Diff(want, got, nil); diff != "" {
+		t.Errorf("object mismatch (-want +got):\n%s", diff)
+		return
+	} else {
+		t.Logf("Got expected output")
+	}
+
 }
 
 func TestPatchPutHTTPHandlers(t *testing.T) {
@@ -291,6 +290,7 @@ func TestPatchPutHTTPHandlers(t *testing.T) {
 }
 `
 	var testPatchName = `{"metadata":{"name": "pwned"}}`
+	var testPatchLabel = `{"metadata":{"labels": {"test": "label"}}}`
 	var corruptedPatch = `{}}`
 	data, _ := os.ReadFile("./testdata/corrupt-pod-a.json")
 	var corruptedPodResource = string(data)
@@ -323,15 +323,25 @@ func TestPatchPutHTTPHandlers(t *testing.T) {
 			expectedStatus:                   http.StatusBadRequest,
 			ignoredFieldsForOutputComparison: cmpopts.IgnoreFields(corev1.Pod{}, "ResourceVersion", "Status.Conditions"),
 		},
-		"patch pod": {
+		"patch pod name": {
 			patchData: testPatchName,
 			reqParams: RequestParams{
 				Method:      http.MethodPatch,
 				Target:      "/api/v1/namespaces/default/pods/bingo",
 				ContentType: "application/strategic-merge-patch+json",
 			},
-			expectedStatus:                   http.StatusOK,
+			expectedStatus:                   http.StatusUnprocessableEntity,
 			ignoredFieldsForOutputComparison: cmpopts.IgnoreFields(corev1.Pod{}, "ResourceVersion", "Name"),
+		},
+		"patch pod ": {
+			patchData: testPatchLabel,
+			reqParams: RequestParams{
+				Method:      http.MethodPatch,
+				Target:      "/api/v1/namespaces/default/pods/bingo",
+				ContentType: "application/strategic-merge-patch+json",
+			},
+			expectedStatus:                   http.StatusOK,
+			ignoredFieldsForOutputComparison: cmpopts.IgnoreFields(corev1.Pod{}, "ResourceVersion", "Labels"),
 		},
 		"patch pod with unsupported content type": {
 			patchData: testPatchName,
@@ -370,14 +380,24 @@ func TestPatchPutHTTPHandlers(t *testing.T) {
 			},
 			expectedStatus: http.StatusBadRequest,
 		},
-		"update with new object": {
+		// "update with new object": {
+		// 	patchData: updatedPodResource,
+		// 	reqParams: RequestParams{
+		// 		Method:      http.MethodPut,
+		// 		Target:      "/api/v1/namespaces/default/pods/bingo",
+		// 		ContentType: "application/json",
+		// 	},
+		// 	expectedStatus:                   http.StatusOK,
+		// 	ignoredFieldsForOutputComparison: cmpopts.IgnoreFields(corev1.Pod{}, "ResourceVersion", "Name"),
+		// },
+		"update with new object changing name": {
 			patchData: updatedPodResource,
 			reqParams: RequestParams{
 				Method:      http.MethodPut,
 				Target:      "/api/v1/namespaces/default/pods/bingo",
 				ContentType: "application/json",
 			},
-			expectedStatus:                   http.StatusOK,
+			expectedStatus:                   http.StatusUnprocessableEntity,
 			ignoredFieldsForOutputComparison: cmpopts.IgnoreFields(corev1.Pod{}, "ResourceVersion", "Name"),
 		},
 	}
@@ -385,7 +405,7 @@ func TestPatchPutHTTPHandlers(t *testing.T) {
 	t.Cleanup(func() { s.Stop(t.Context()) })
 	for name, tc := range patchTests {
 		t.Run(name, func(t *testing.T) {
-			t.Cleanup(func() { cleanupTestPod(t, s, api.MatchCriteria{}) })
+			t.Cleanup(func() { s.baseView.Reset() })
 
 			jsonData, err := os.ReadFile("./testdata/pod-a.json")
 			if err != nil {
@@ -462,7 +482,7 @@ func TestPatchPutNoObject(t *testing.T) {
 	t.Cleanup(func() { s.Stop(t.Context()) })
 	for name, tc := range patchTests {
 		t.Run(name, func(t *testing.T) {
-			t.Cleanup(func() { cleanupTestPod(t, s, api.MatchCriteria{}) })
+			t.Cleanup(func() { s.baseView.Reset() })
 
 			jsonData, err := os.ReadFile("./testdata/pod-a.json")
 			if err != nil {
@@ -587,11 +607,7 @@ func TestNoObject(t *testing.T) {
 	t.Cleanup(func() { s.Stop(t.Context()) })
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			t.Cleanup(func() {
-				cleanupTestPod(t, s, api.MatchCriteria{
-					LabelSelector: labels.SelectorFromSet(map[string]string{"app.kubernetes.io/component": "minkapitest"}),
-				})
-			})
+			t.Cleanup(func() { s.baseView.Reset() })
 
 			jsonData, req := getRequestAndData(t, tc.filePath, tc.reqParams)
 			w := httptest.NewRecorder()
@@ -633,11 +649,7 @@ func TestWatch(t *testing.T) {
 	t.Cleanup(func() { s.Stop(t.Context()) })
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			t.Cleanup(func() {
-				cleanupTestPod(t, s, api.MatchCriteria{
-					LabelSelector: labels.SelectorFromSet(map[string]string{"app.kubernetes.io/component": "minkapitest"}),
-				})
-			})
+			t.Cleanup(func() { s.baseView.Reset() })
 
 			if _, err := createObjectFromFileName[corev1.Pod](t, s, "./testdata/pod-a.json", typeinfo.PodsDescriptor.GVK); err != nil {
 				t.Errorf("Error creating test object: %v", err)
@@ -658,7 +670,7 @@ func TestWatch(t *testing.T) {
 				t.Errorf("Unexpected status code, got: %d, expected: %d", resp.StatusCode, tc.expectedStatus)
 				return
 			} else if resp.StatusCode != http.StatusOK {
-				t.Logf("Expected status error: %d", tc.expectedStatus)
+				t.Logf("Expected status: %d", tc.expectedStatus)
 				return
 			}
 		})
@@ -744,7 +756,7 @@ func getRequestType(t *testing.T, reqMethod, reqTarget, resourceName string) str
 func handlePodDeletionResponse(t *testing.T, s *InMemoryKAPI, wantData []byte) error {
 	t.Helper()
 	wantPod, _ := convertJSONtoObject[corev1.Pod](t, wantData)
-	p, err := s.baseView.ListPods(wantPod.Namespace, []string{wantPod.Name}...)
+	p, err := s.baseView.ListPods(mkapi.MatchCriteria{Namespace: wantPod.Namespace, Names: sets.New(wantPod.Name)})
 	if err != nil {
 		return fmt.Errorf("Error listing pods")
 	}
@@ -790,9 +802,9 @@ func compareHTTPHandlerResponse(t *testing.T, s *InMemoryKAPI, resp *http.Respon
 	}
 
 	if resp.StatusCode != expectedStatus {
-		return fmt.Errorf("Unexpected status code, got: %d, expected: %d", resp.StatusCode, expectedStatus)
+		return fmt.Errorf("Unexpected status code, got: %s, expected: %d", resp.Status, expectedStatus)
 	} else if resp.StatusCode != http.StatusOK {
-		t.Logf("Expected status error: %d", expectedStatus)
+		t.Logf("Expected status: %s", resp.Status)
 		return nil
 	}
 
@@ -835,7 +847,7 @@ func compareHTTPHandlerResponse(t *testing.T, s *InMemoryKAPI, resp *http.Respon
 		t.Errorf("%s object mismatch (-want +got):\n%s", reqType, diff)
 		return err
 	}
-	t.Cleanup(func() { cleanupTestPod(t, s, api.MatchCriteria{Names: sets.New(got.Name)}) })
+	// t.Cleanup(func() { s.baseView.Reset() })
 
 	return nil
 }
@@ -859,7 +871,7 @@ func createObjectFromFileName[T any](t *testing.T, svc *InMemoryKAPI, fileName s
 	if !ok {
 		return obj, err
 	}
-	err = svc.baseView.StoreObject(gvk, objInterface)
+	err = svc.baseView.CreateObject(gvk, objInterface)
 	if err != nil {
 		return obj, err
 	}
@@ -870,14 +882,14 @@ func createObjectFromFileName[T any](t *testing.T, svc *InMemoryKAPI, fileName s
 func startMinkapiService(t *testing.T) (*InMemoryKAPI, *http.ServeMux, error) { // Need this explicitly in order to get baseViewMux
 	t.Helper()
 	var err error
-	cfg := api.MinKAPIConfig{
-		BasePrefix: api.DefaultBasePrefix,
+	cfg := mkapi.Config{
+		BasePrefix: mkapi.DefaultBasePrefix,
 		ServerConfig: commontypes.ServerConfig{
 			HostPort:       commontypes.HostPort{Host: "localhost", Port: 9892},
-			KubeConfigPath: "/tmp/minkapi-test.yaml",
+			KubeConfigPath: "/tmp/minkmkapi-test.yaml",
 		},
-		WatchConfig: api.WatchConfig{
-			QueueSize: api.DefaultWatchQueueSize,
+		WatchConfig: mkapi.WatchConfig{
+			QueueSize: mkapi.DefaultWatchQueueSize,
 			Timeout:   500 * time.Millisecond,
 		},
 	}
@@ -885,12 +897,12 @@ func startMinkapiService(t *testing.T) (*InMemoryKAPI, *http.ServeMux, error) { 
 
 	defer func() {
 		if err != nil {
-			err = fmt.Errorf("%w: %w", api.ErrInitFailed, err)
+			err = fmt.Errorf("%w: %w", mkapi.ErrInitFailed, err)
 		}
 	}()
 	scheme := typeinfo.SupportedScheme
-	baseView, err := view.New(log, &api.ViewArgs{
-		Name:           api.DefaultBasePrefix,
+	baseView, err := view.New(log, &mkapi.ViewArgs{
+		Name:           mkapi.DefaultBasePrefix,
 		KubeConfigPath: cfg.KubeConfigPath,
 		Scheme:         scheme,
 		WatchConfig:    cfg.WatchConfig,
@@ -936,14 +948,4 @@ func convertJSONtoObject[T any](t *testing.T, data []byte) (T, error) {
 		return obj, err
 	}
 	return obj, nil
-}
-
-func cleanupTestPod(t *testing.T, s *InMemoryKAPI, c api.MatchCriteria) {
-	t.Helper()
-	err := s.baseView.DeleteObjects(typeinfo.PodsDescriptor.GVK, c)
-	if err != nil {
-		t.Errorf("Error while performing cleanup of pods: %v", err)
-		return
-	}
-	t.Logf(">>> Cleanup: Deleting Pod")
 }

@@ -6,12 +6,13 @@ package minkapi
 
 import (
 	"context"
-	"github.com/go-logr/logr"
 	"io"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/cache"
 	"sync/atomic"
 	"time"
+
+	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
 
 	commontypes "github.com/gardener/scaling-advisor/api/common/types"
 	corev1 "k8s.io/api/core/v1"
